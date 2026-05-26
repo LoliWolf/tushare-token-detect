@@ -5,11 +5,21 @@
 #   pip install requests
 #   python detect.py
 #
+# 指定并发：
+#   python detect.py --workers 10
+#
 # 默认读取：
 #   input.json
 #
 # 默认输出：
 #   tushare_token_scores.json
+#
+# 输出格式：
+#   {
+#     "token1": 5000,
+#     "token2": 120,
+#     "token3": 0
+#   }
 
 import argparse
 import json
@@ -17,6 +27,9 @@ import os
 import sys
 import time
 import tempfile
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 import requests
 
 API_URL = "http://api.tushare.pro"
@@ -25,6 +38,9 @@ DEFAULT_INPUT_FILE = "input.json"
 DEFAULT_OUTPUT_FILE = "tushare_token_scores.json"
 
 REQUEST_SLEEP = 0.8
+DEFAULT_WORKERS = 10
+
+log_lock = threading.Lock()
 
 
 PROBES = [
@@ -107,7 +123,15 @@ PROBES = [
 
 
 def log(*args):
-    print(*args, file=sys.stderr)
+    with log_lock:
+        print(*args, file=sys.stderr)
+
+
+def mask_token(token: str) -> str:
+    token = token.strip()
+    if len(token) <= 12:
+        return token[:3] + "***"
+    return token[:6] + "..." + token[-6:]
 
 
 def load_input_tokens(path: str):
@@ -117,7 +141,7 @@ def load_input_tokens(path: str):
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
 
-    # 支持两种格式：
+    # 支持：
     # 1. ["token1", "token2"]
     # 2. {"tokens": ["token1", "token2"]}
     if isinstance(data, list):
@@ -146,7 +170,7 @@ def load_input_tokens(path: str):
     return tokens
 
 
-def call_tushare(token, api_name, params, fields):
+def call_tushare(session, token, api_name, params, fields):
     payload = {
         "api_name": api_name,
         "token": token,
@@ -154,7 +178,7 @@ def call_tushare(token, api_name, params, fields):
         "fields": fields,
     }
 
-    resp = requests.post(API_URL, json=payload, timeout=20)
+    resp = session.post(API_URL, json=payload, timeout=20)
     resp.raise_for_status()
     return resp.json()
 
@@ -210,7 +234,7 @@ def load_history_score_map(path: str) -> dict:
             try:
                 result[str(token)] = int(score)
             except Exception:
-                log(f"[历史分数非法-忽略] token={token} score={score}")
+                log(f"[历史分数非法-忽略] token={mask_token(str(token))} score={score}")
 
         return result
 
@@ -243,47 +267,58 @@ def atomic_write_json(path: str, data: dict):
         raise
 
 
-def probe_token_min_score(token: str) -> int:
+def probe_token_min_score(token: str, idx: int, total: int) -> int:
+    """
+    单个 token 内部仍然串行探测。
+    10 并发发生在 token 维度，而不是一个 token 同时打多个接口。
+    """
     lower_bound = 0
+    token_show = mask_token(token)
 
-    for probe in PROBES:
-        score = probe["score"]
-        api_name = probe["api_name"]
+    log(f"[{idx}/{total}] start token={token_show}")
 
-        try:
-            result = call_tushare(
-                token=token,
-                api_name=api_name,
-                params=probe["params"],
-                fields=probe["fields"],
-            )
-        except Exception as e:
-            log(f"[请求失败] score={score} api={api_name} err={e}")
+    with requests.Session() as session:
+        for probe in PROBES:
+            score = probe["score"]
+            api_name = probe["api_name"]
+
+            try:
+                result = call_tushare(
+                    session=session,
+                    token=token,
+                    api_name=api_name,
+                    params=probe["params"],
+                    fields=probe["fields"],
+                )
+            except Exception as e:
+                log(f"[{idx}/{total}] [请求失败] token={token_show} score={score} api={api_name} err={e}")
+                time.sleep(REQUEST_SLEEP)
+                continue
+
+            code = result.get("code")
+            msg = result.get("msg") or ""
+
+            if code == 0:
+                lower_bound = max(lower_bound, score)
+                log(f"[{idx}/{total}] [通过] token={token_show} >= {score:<5} api={api_name}")
+
+            elif is_rate_limit_error(code, msg):
+                # 频率超限不能证明没权限，也不能加分；跳过，靠历史 max 兜底。
+                log(f"[{idx}/{total}] [频率超限-跳过] token={token_show} score={score:<5} api={api_name} msg={msg}")
+
+            elif is_token_error(code, msg):
+                log(f"[{idx}/{total}] [token无效] token={token_show} api={api_name} msg={msg}")
+                return 0
+
+            elif is_permission_error(code, msg):
+                log(f"[{idx}/{total}] [权限不足] token={token_show} < {score:<5} api={api_name} msg={msg}")
+
+            else:
+                log(f"[{idx}/{total}] [未知结果-跳过] token={token_show} score={score:<5} api={api_name} code={code} msg={msg}")
+
             time.sleep(REQUEST_SLEEP)
-            continue
 
-        code = result.get("code")
-        msg = result.get("msg") or ""
-
-        if code == 0:
-            lower_bound = max(lower_bound, score)
-            log(f"[通过] >= {score:<5} api={api_name}")
-
-        elif is_rate_limit_error(code, msg):
-            log(f"[频率超限-跳过] score={score:<5} api={api_name} msg={msg}")
-
-        elif is_token_error(code, msg):
-            log(f"[token无效] api={api_name} msg={msg}")
-            return 0
-
-        elif is_permission_error(code, msg):
-            log(f"[权限不足] <  {score:<5} api={api_name} msg={msg}")
-
-        else:
-            log(f"[未知结果-跳过] score={score:<5} api={api_name} code={code} msg={msg}")
-
-        time.sleep(REQUEST_SLEEP)
-
+    log(f"[{idx}/{total}] done token={token_show} current_score={lower_bound}")
     return lower_bound
 
 
@@ -299,38 +334,63 @@ def main():
         default=DEFAULT_OUTPUT_FILE,
         help="输出积分下限 JSON 文件，默认 tushare_token_scores.json",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=DEFAULT_WORKERS,
+        help="token 级别并发数，默认 10",
+    )
     args = parser.parse_args()
 
     tokens = load_input_tokens(args.input)
-
     history_map = load_history_score_map(args.output)
     score_map = dict(history_map)
 
+    total = len(tokens)
+    workers = max(1, int(args.workers))
+
     log(f"读取输入文件：{args.input}")
-    log(f"输入 token 数：{len(tokens)}")
+    log(f"输入 token 数：{total}")
     log(f"读取历史文件：{args.output}")
     log(f"历史 token 数：{len(history_map)}")
+    log(f"并发数：{workers}")
 
-    for idx, token in enumerate(tokens, start=1):
-        old_score = int(history_map.get(token, 0))
+    futures = {}
 
-        log("")
-        log(f"[{idx}/{len(tokens)}] probing token={token}")
-        log(f"[历史分数] {old_score}")
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        for idx, token in enumerate(tokens, start=1):
+            future = executor.submit(probe_token_min_score, token, idx, total)
+            futures[future] = token
 
-        current_score = probe_token_min_score(token)
-        final_score = max(old_score, current_score)
+        finished = 0
 
-        score_map[token] = final_score
+        for future in as_completed(futures):
+            token = futures[future]
+            token_show = mask_token(token)
+            old_score = int(history_map.get(token, 0))
 
-        log(f"[本次分数] {current_score}")
-        log(f"[最终分数] max({old_score}, {current_score}) = {final_score}")
+            try:
+                current_score = int(future.result())
+            except Exception as e:
+                log(f"[任务异常] token={token_show} err={e}")
+                current_score = 0
 
-        atomic_write_json(args.output, score_map)
-        log(f"[已更新文件] {args.output}")
+            final_score = max(old_score, current_score)
+            score_map[token] = final_score
+
+            finished += 1
+
+            log(
+                f"[合并] token={token_show} "
+                f"history={old_score}, current={current_score}, final={final_score} "
+                f"({finished}/{total})"
+            )
+
+            # 每完成一个 token 就落盘，避免中途断掉丢结果。
+            atomic_write_json(args.output, score_map)
+            log(f"[已更新文件] {args.output}")
 
     atomic_write_json(args.output, score_map)
-    log("")
     log(f"完成，已写入：{args.output}")
 
 
