@@ -11,6 +11,11 @@
 # 默认读取：
 #   input.json
 #
+# input.json 支持三种格式：
+#   ["token1", "token2"]
+#   {"tokens": ["token1", "token2"]}
+#   {"findings": [{"raw_token": "..."}, ...]}   # github_tushare_findings.json 同款
+#
 # 默认输出：
 #   tushare_token_scores.json
 #
@@ -144,14 +149,18 @@ def load_input_tokens(path: str):
     # 支持：
     # 1. ["token1", "token2"]
     # 2. {"tokens": ["token1", "token2"]}
+    # 3. {"findings": [{"raw_token": "..."}, ...]}
     if isinstance(data, list):
         raw_tokens = data
     elif isinstance(data, dict) and isinstance(data.get("tokens"), list):
         raw_tokens = data["tokens"]
+    elif isinstance(data, dict) and isinstance(data.get("findings"), list):
+        raw_tokens = [f.get("raw_token") for f in data["findings"]]
     else:
         raise ValueError(
             "input.json 格式错误，只支持："
-            '["token1", "token2"] 或 {"tokens": ["token1", "token2"]}'
+            '["token1", "token2"]、{"tokens": ["token1", "token2"]} '
+            '或 {"findings": [{"raw_token": "..."}, ...]}'
         )
 
     tokens = []
