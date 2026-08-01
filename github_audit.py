@@ -24,7 +24,7 @@ DEFAULT_ALLOWLIST_FILE = "github_user_allowlist.json"
 DEFAULT_OUTPUT_FILE = "github_tushare_findings.json"
 DEFAULT_TIMEOUT = 20.0
 DEFAULT_SEARCH_INTERVAL = 6.2
-DEFAULT_MAX_PAGES = 10000
+DEFAULT_MAX_PAGES = 100
 MAX_SEARCH_RESULTS = 1000
 MAX_FILE_BYTES = 1024 * 1024
 
@@ -544,8 +544,8 @@ def audit_user(
 
 def positive_int(value: str) -> int:
     parsed = int(value)
-    if parsed < 1 or parsed > 10:
-        raise argparse.ArgumentTypeError("必须在 1 到 10 之间")
+    if parsed < 1 or parsed > 1000:
+        raise argparse.ArgumentTypeError("必须在 1 到 1000 之间")
     return parsed
 
 
