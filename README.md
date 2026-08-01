@@ -114,21 +114,15 @@ Token 的积分等级为其成功调用的 API 所需的最高积分值。
 
 ## GitHub 防泄漏审计
 
-`github_audit.py` 用于扫描指定 GitHub **个人用户**名下、当前身份有写入或管理权限的仓库，定位疑似硬编码的 Tushare Token。它与积分检测流程完全隔离：不会展示、保存或调用搜索到的候选值。
+`github_audit.py` 在 **GitHub 全站公开仓库** 中搜索疑似硬编码的 Tushare Token。对搜索结果，先按仓库 owner 匹配本地白名单（支持精确用户名和正则），匹配的仓库才下载文件进行本地检测。
 
-搜索会组合 `tushare`、`TUSHARE_TOKEN`、`TUSHARE_KEY`、`TS_TOKEN`、`ts.set_token` 和 `ts.pro_api` 等近似特征；本地检测同时覆盖 `TUSHARE_ACCESS_TOKEN`、`tushareApiKey`、`TS_API_TOKEN` 以及上下文中的通用 `token` 赋值。
+搜索会组合 `tushare`、`TUSHARE_TOKEN`、`TS_TOKEN`、`ts.set_token` 和 `ts.pro_api` 等特征；本地检测覆盖 `TUSHARE_ACCESS_TOKEN`、`tushareApiKey`、`TS_API_TOKEN` 以及上下文中的通用 `token` 赋值。
 
-安全限制：
-
-- 目标用户必须精确命中本地白名单；未命中时不会创建 GitHub 客户端或发送网络请求
-- 只扫描 `GITHUB_TOKEN` 当前身份具有 `push`、`maintain` 或 `admin` 权限的目标用户仓库
-- 结果只包含仓库、文件、行号、GitHub 链接、检测规则和 HMAC 指纹
-- 原始候选值只在进程内存中用于匹配和计算 HMAC，不写入日志或结果文件
-- 输出文件以 `0600` 权限原子写入
+> 注意：扫描到的 Token **原始值会被记录在输出 JSON 中**（`raw_token` 字段），用于统一回收清理。请妥善保管输出文件，用完即删。
 
 ### 1. 配置白名单
 
-复制示例文件并填写允许扫描的 GitHub 用户名。白名单仅支持精确用户名，不支持通配符：
+复制示例文件并填写允许扫描的 GitHub 用户名或组织。支持精确用户名和 `/正则/` 两种写法：
 
 ```bash
 cp github_user_allowlist.example.json github_user_allowlist.json
@@ -136,7 +130,10 @@ cp github_user_allowlist.example.json github_user_allowlist.json
 
 ```json
 {
-  "users": ["your-github-user"]
+  "users": [
+    "your-github-user",
+    "/^my-org.*$/"
+  ]
 }
 ```
 
@@ -144,44 +141,41 @@ cp github_user_allowlist.example.json github_user_allowlist.json
 
 ### 2. 配置环境变量
 
-使用环境变量传入 GitHub 凭证和至少 32 字节的 HMAC 密钥，不要把它们写入命令行参数或配置文件：
-
 ```bash
 export GITHUB_TOKEN="你的 GitHub Token"
-export TUSHARE_AUDIT_HMAC_KEY="至少 32 字节的随机密钥"
 ```
 
-GitHub Token 需要能够读取待扫描仓库。脚本还会根据 GitHub 返回的仓库权限进行二次拦截。
+使用任意能调用公开 Code Search API 的 GitHub Token 即可（Classic token 或 Fine-grained token），不需要仓库写权限。
 
 ### 3. 运行审计
 
 ```bash
-python github_audit.py --user your-github-user
+python github_audit.py
 ```
 
 指定白名单和输出位置：
 
 ```bash
 python github_audit.py \
-  --user your-github-user \
   --allowlist github_user_allowlist.json \
   --output github_tushare_findings.json
 ```
 
-在 CI 中发现疑似泄漏时返回退出码 `1`：
+其他参数：
 
-```bash
-python github_audit.py --user your-github-user --fail-on-findings
-```
+- `--max-pages`：每个查询最多读取的搜索结果页数，1-10，默认 10
+- `--search-interval`：相邻搜索请求的最小秒数，默认 6.2（避开 GitHub 搜索限流）
+- `--fail-on-findings`：发现疑似泄漏时返回退出码 `1`，适合 CI
 
-脱敏输出示例：
+输出示例：
 
 ```json
 {
   "schema_version": 1,
-  "target_user": "your-github-user",
-  "scanned_at": "2026-07-29T01:00:00Z",
-  "repositories_scanned": 1,
+  "scanned_at": "2026-08-01T01:00:00Z",
+  "repositories_scanned": 3,
+  "total_results": 20,
+  "skipped_results": 15,
   "scan_incomplete": false,
   "findings": [
     {
@@ -190,7 +184,8 @@ python github_audit.py --user your-github-user --fail-on-findings
       "line": 12,
       "url": "https://github.com/your-github-user/example/blob/main/config.py#L12",
       "detector": "named_constant",
-      "fingerprint": "hmac-sha256:0123456789abcdef01234567"
+      "fingerprint": "sha256:0123456789abcdef01234567",
+      "raw_token": "实际扫描到的 Token 值"
     }
   ]
 }
