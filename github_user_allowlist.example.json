@@ -1,0 +1,6 @@
+{
+  "users": [
+    "your-github-user",
+    "/^org-.*$/"
+  ]
+}

@@ -1,2 +1,8 @@
+__pycache__/
+*.py[cod]
+
+# 本地输入、凭证审计配置与结果
 input.json
 tushare_token_scores.json
+github_user_allowlist.json
+github_tushare_findings.json
