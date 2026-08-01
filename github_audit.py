@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""在授权的 GitHub 用户仓库中审计疑似 Tushare Token 泄漏。
+"""在 GitHub 公开仓库中审计疑似 Tushare Token 泄漏。
 
-安全约束：
-1. 目标用户必须先通过本地白名单，白名单未命中时不会发起网络请求。
-2. 只扫描当前 GITHUB_TOKEN 对其具有 push/admin/maintain 权限的仓库。
-3. 扫描到的 Token 原始值会被记录并输出，请注意妥善保管输出文件。
+策略：
+1. 从白名单加载允许扫描的用户/组织（支持精确字符串和 /regex/ 正则）。
+2. 通过 GitHub Code Search API 全站搜索公开代码中可能包含 Tushare Token 的文件。
+3. 对搜索结果中的每个文件，检查其仓库 owner 是否匹配白名单，匹配才下载分析。
+4. 扫描到的 Token 原始值会被记录并输出，请注意妥善保管输出文件。
 """
 
 from __future__ import annotations
@@ -41,7 +42,6 @@ MAX_FILE_BYTES = 1024 * 1024
 GITHUB_LOGIN_RE = re.compile(
     r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$"
 )
-REPOSITORY_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 TOKEN_VALUE = r"[A-Za-z0-9]{32,128}(?![A-Za-z0-9])"
 ASSIGNMENT_OPERATOR = r"(?::=|=>|=|:)"
 
@@ -113,10 +113,6 @@ class AuditError(RuntimeError):
     """可安全展示给终端用户的审计错误。"""
 
 
-class WhitelistDenied(AuditError):
-    """目标用户未通过扫描白名单。"""
-
-
 class GitHubAPIError(AuditError):
     """GitHub API 调用失败，错误信息不得包含文件内容。"""
 
@@ -154,7 +150,26 @@ def normalize_login(login: str) -> str:
     return value.casefold()
 
 
-def load_allowlist(path: str | os.PathLike[str]) -> set[str]:
+@dataclass(frozen=True)
+class Allowlist:
+    exact: frozenset[str]
+    patterns: tuple[re.Pattern[str], ...]
+
+    def is_allowed(self, login: str) -> bool:
+        normalized = normalize_login(login)
+        if normalized in self.exact:
+            return True
+        for pattern in self.patterns:
+            if pattern.fullmatch(normalized):
+                return True
+        return False
+
+    @classmethod
+    def empty(cls) -> "Allowlist":
+        return cls(exact=frozenset(), patterns=())
+
+
+def load_allowlist(path: str | os.PathLike[str]) -> Allowlist:
     allowlist_path = Path(path)
     if not allowlist_path.is_file():
         raise AuditError(f"白名单文件不存在：{allowlist_path}")
@@ -177,31 +192,21 @@ def load_allowlist(path: str | os.PathLike[str]) -> set[str]:
     if not isinstance(raw_users, list):
         raise AuditError('白名单格式必须是 ["user"] 或 {"users": ["user"]}')
 
-    allowed: set[str] = set()
+    exact: set[str] = set()
+    patterns: list[re.Pattern[str]] = []
+
     for entry in raw_users:
         if not isinstance(entry, str):
             raise AuditError("白名单中的 GitHub 用户名必须是字符串")
-        allowed.add(normalize_login(entry))
-
-    return allowed
-
-
-def enforce_allowlist(target_user: str, allowlist_path: str) -> str:
-    """在创建 GitHub 客户端之前执行的失败关闭白名单检查。"""
-    normalized_target = normalize_login(target_user)
-    allowed = load_allowlist(allowlist_path)
-    for entry in allowed:
         if entry.startswith("/") and entry.endswith("/"):
             try:
-                if re.fullmatch(entry[1:-1], normalized_target):
-                    return normalized_target
+                patterns.append(re.compile(entry[1:-1]))
             except re.error:
                 continue
-        if normalized_target == entry:
-            return normalized_target
-    raise WhitelistDenied(
-        f"目标用户 {target_user!r} 不在白名单中，已在网络请求前拦截"
-    )
+        else:
+            exact.add(normalize_login(entry))
+
+    return Allowlist(exact=frozenset(exact), patterns=tuple(patterns))
 
 
 def load_required_secret(environ: Mapping[str, str], name: str) -> str:
@@ -371,58 +376,6 @@ class GitHubClient:
             raise GitHubAPIError("GitHub API JSON 结构异常")
         return data
 
-    def writable_repositories(self, target_user: str) -> list[str]:
-        """列出当前身份可写、且由目标个人账号拥有的仓库。"""
-        repositories: set[str] = set()
-        page = 1
-
-        while True:
-            response = self._request(
-                "GET",
-                f"{GITHUB_API_URL}/user/repos",
-                params={
-                    "affiliation": "owner,collaborator",
-                    "visibility": "all",
-                    "sort": "full_name",
-                    "direction": "asc",
-                    "per_page": 100,
-                    "page": page,
-                },
-            )
-            try:
-                items = response.json()
-            except (ValueError, json.JSONDecodeError):
-                raise GitHubAPIError("GitHub 仓库列表返回了无效 JSON") from None
-            if not isinstance(items, list):
-                raise GitHubAPIError("GitHub 仓库列表结构异常")
-
-            for item in items:
-                if not isinstance(item, dict):
-                    continue
-                owner = item.get("owner") or {}
-                permissions = item.get("permissions") or {}
-                if not isinstance(owner, dict) or not isinstance(permissions, dict):
-                    continue
-                owner_login = str(owner.get("login") or "").casefold()
-                writable = any(
-                    permissions.get(name) is True
-                    for name in ("push", "maintain", "admin")
-                )
-                full_name = str(item.get("full_name") or "")
-
-                if (
-                    owner_login == target_user
-                    and writable
-                    and REPOSITORY_NAME_RE.fullmatch(full_name)
-                ):
-                    repositories.add(full_name)
-
-            if len(items) < 100:
-                break
-            page += 1
-
-        return sorted(repositories, key=str.casefold)
-
     def _wait_for_search_slot(self) -> None:
         if self._last_search_at is not None and self.search_interval > 0:
             elapsed = time.monotonic() - self._last_search_at
@@ -431,17 +384,14 @@ class GitHubClient:
                 time.sleep(remaining)
         self._last_search_at = time.monotonic()
 
-    def search_repository(
+    def search_global(
         self,
-        repository: str,
         *,
         max_pages: int,
     ) -> tuple[list[dict[str, Any]], bool]:
-        if not REPOSITORY_NAME_RE.fullmatch(repository):
-            raise GitHubAPIError("仓库全名格式异常")
-
+        """全站搜索公开代码中可能包含 Tushare Token 的文件。"""
         expression = " OR ".join(SEARCH_TERMS)
-        query = f"({expression}) in:file repo:{repository}"
+        query = f"({expression}) in:file"
         results: dict[tuple[str, str], dict[str, Any]] = {}
         incomplete = False
 
@@ -475,7 +425,7 @@ class GitHubClient:
                     continue
                 full_name = str(result_repo.get("full_name") or "")
                 path = str(item.get("path") or "")
-                if full_name.casefold() != repository.casefold() or not path:
+                if not full_name or not path:
                     continue
                 results[(full_name.casefold(), path)] = item
 
@@ -533,49 +483,52 @@ def atomic_write_json(path: str | os.PathLike[str], data: Mapping[str, Any]) -> 
 
 def audit_user(
     client: GitHubClient,
-    target_user: str,
+    allowlist: Allowlist,
     hmac_key: bytes,
     *,
     max_pages: int,
 ) -> dict[str, Any]:
-    repositories = client.writable_repositories(target_user)
-    if not repositories:
-        raise AuditError(
-            f"当前 GitHub 身份对用户 {target_user!r} 名下没有可写仓库，拒绝扫描"
-        )
+    items, scan_incomplete = client.search_global(max_pages=max_pages)
 
+    scanned_repos: set[str] = set()
     findings: list[Finding] = []
-    scan_incomplete = False
+    skipped_count = 0
 
-    for index, repository in enumerate(repositories, start=1):
-        log(f"[{index}/{len(repositories)}] 搜索仓库：{repository}")
-        items, repository_incomplete = client.search_repository(
-            repository,
-            max_pages=max_pages,
-        )
-        scan_incomplete = scan_incomplete or repository_incomplete
+    for item in items:
+        result_repo = item.get("repository") or {}
+        if not isinstance(result_repo, dict):
+            continue
+        full_name = str(result_repo.get("full_name") or "")
+        owner_login = full_name.split("/", 1)[0] if "/" in full_name else ""
 
-        for item in items:
-            path = str(item.get("path") or "")
-            html_url = str(item.get("html_url") or "")
-            try:
-                content = client.fetch_file_text(item)
-                if content is None:
-                    scan_incomplete = True
-                    log(f"[跳过超大文件] repository={repository} path={path!r}")
-                    continue
-                findings.extend(
-                    scan_content(
-                        content=content,
-                        repository=repository,
-                        path=path,
-                        html_url=html_url,
-                        hmac_key=hmac_key,
-                    )
-                )
-            except GitHubAPIError as exc:
+        if not allowlist.is_allowed(owner_login):
+            skipped_count += 1
+            continue
+
+        scanned_repos.add(full_name.casefold())
+        path = str(item.get("path") or "")
+        html_url = str(item.get("html_url") or "")
+        try:
+            content = client.fetch_file_text(item)
+            if content is None:
                 scan_incomplete = True
-                log(f"[文件读取失败] repository={repository} path={path!r}：{exc}")
+                log(f"[跳过超大文件] repository={full_name} path={path!r}")
+                continue
+            findings.extend(
+                scan_content(
+                    content=content,
+                    repository=full_name,
+                    path=path,
+                    html_url=html_url,
+                    hmac_key=hmac_key,
+                )
+            )
+        except GitHubAPIError as exc:
+            scan_incomplete = True
+            log(f"[文件读取失败] repository={full_name} path={path!r}：{exc}")
+
+    if skipped_count:
+        log(f"已跳过 {skipped_count} 个不匹配白名单的仓库文件")
 
     unique_findings = {
         (
@@ -598,9 +551,10 @@ def audit_user(
 
     return {
         "schema_version": 1,
-        "target_user": target_user,
         "scanned_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-        "repositories_scanned": len(repositories),
+        "repositories_scanned": len(scanned_repos),
+        "total_results": len(items),
+        "skipped_results": skipped_count,
         "scan_incomplete": scan_incomplete,
         "findings": [finding.to_dict() for finding in ordered_findings],
     }
@@ -622,24 +576,23 @@ def non_negative_float(value: str) -> float:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="审计指定 GitHub 用户的授权仓库中是否泄漏 Tushare Token"
+        description="在 GitHub 公开仓库中审计 Tushare Token 泄漏，按白名单过滤仓库 owner"
     )
-    parser.add_argument("--user", required=True, help="要审计的 GitHub 个人用户名")
     parser.add_argument(
         "--allowlist",
         default=DEFAULT_ALLOWLIST_FILE,
-        help=f"扫描用户白名单 JSON，默认 {DEFAULT_ALLOWLIST_FILE}",
+        help=f"扫描 user/organization 白名单 JSON，支持 /regex/，默认 {DEFAULT_ALLOWLIST_FILE}",
     )
     parser.add_argument(
         "--output",
         default=DEFAULT_OUTPUT_FILE,
-        help=f"脱敏结果 JSON，默认 {DEFAULT_OUTPUT_FILE}",
+        help=f"审计结果 JSON（包含原始 Token），默认 {DEFAULT_OUTPUT_FILE}",
     )
     parser.add_argument(
         "--max-pages",
         type=positive_int,
         default=DEFAULT_MAX_PAGES,
-        help="每个仓库最多读取的搜索结果页数，1-10，默认 10",
+        help="最多读取的搜索结果页数，1-10，默认 10",
     )
     parser.add_argument(
         "--search-interval",
@@ -663,8 +616,7 @@ def run(
 ) -> int:
     args = build_parser().parse_args(argv)
 
-    # 必须保持在所有凭证读取、GitHub 客户端创建和网络请求之前。
-    target_user = enforce_allowlist(args.user, args.allowlist)
+    allowlist = load_allowlist(args.allowlist)
 
     active_environ = os.environ if environ is None else environ
     github_token = load_required_secret(active_environ, "GITHUB_TOKEN")
@@ -676,7 +628,7 @@ def run(
     )
     report = audit_user(
         client,
-        target_user,
+        allowlist,
         hmac_key,
         max_pages=args.max_pages,
     )
