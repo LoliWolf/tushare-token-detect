@@ -1,18 +1,7 @@
-#!/usr/bin/env python3
-"""在 GitHub 公开仓库中审计疑似 Tushare Token 泄漏。
-
-策略：
-1. 从白名单加载允许扫描的用户/组织（支持精确字符串和 /regex/ 正则）。
-2. 通过 GitHub Code Search API 全站搜索公开代码中可能包含 Tushare Token 的文件。
-3. 对搜索结果中的每个文件，检查其仓库 owner 是否匹配白名单，匹配才下载分析。
-4. 扫描到的 Token 原始值会被记录并输出，请注意妥善保管输出文件。
-"""
-
 from __future__ import annotations
 
 import argparse
 import hashlib
-import hmac
 import json
 import math
 import os
@@ -216,14 +205,6 @@ def load_required_secret(environ: Mapping[str, str], name: str) -> str:
     return value
 
 
-def load_hmac_key(environ: Mapping[str, str]) -> bytes:
-    raw_key = load_required_secret(environ, "TUSHARE_AUDIT_HMAC_KEY")
-    key = raw_key.encode("utf-8")
-    if len(key) < 32:
-        raise AuditError("TUSHARE_AUDIT_HMAC_KEY 至少需要 32 字节")
-    return key
-
-
 def shannon_entropy(value: str) -> float:
     if not value:
         return 0.0
@@ -247,9 +228,9 @@ def is_plausible_secret(candidate: str) -> bool:
     return shannon_entropy(candidate) >= 3.0
 
 
-def fingerprint_secret(candidate: str, hmac_key: bytes) -> str:
-    digest = hmac.new(hmac_key, candidate.encode("utf-8"), hashlib.sha256).hexdigest()
-    return f"hmac-sha256:{digest[:24]}"
+def fingerprint_secret(candidate: str) -> str:
+    digest = hashlib.sha256(candidate.encode("utf-8")).hexdigest()
+    return f"sha256:{digest[:24]}"
 
 
 def line_number_at(content: str, offset: int) -> int:
@@ -281,7 +262,6 @@ def scan_content(
     repository: str,
     path: str,
     html_url: str,
-    hmac_key: bytes,
 ) -> list[Finding]:
     findings: list[Finding] = []
     seen: set[tuple[int, str]] = set()
@@ -295,7 +275,7 @@ def scan_content(
                 continue
 
             line = line_number_at(content, match.start("secret"))
-            fingerprint = fingerprint_secret(candidate, hmac_key)
+            fingerprint = fingerprint_secret(candidate)
             identity = (line, fingerprint)
             if identity in seen:
                 continue
@@ -484,7 +464,6 @@ def atomic_write_json(path: str | os.PathLike[str], data: Mapping[str, Any]) -> 
 def audit_user(
     client: GitHubClient,
     allowlist: Allowlist,
-    hmac_key: bytes,
     *,
     max_pages: int,
 ) -> dict[str, Any]:
@@ -520,7 +499,6 @@ def audit_user(
                     repository=full_name,
                     path=path,
                     html_url=html_url,
-                    hmac_key=hmac_key,
                 )
             )
         except GitHubAPIError as exc:
@@ -620,7 +598,6 @@ def run(
 
     active_environ = os.environ if environ is None else environ
     github_token = load_required_secret(active_environ, "GITHUB_TOKEN")
-    hmac_key = load_hmac_key(active_environ)
 
     client = client_type(
         github_token,
@@ -629,7 +606,6 @@ def run(
     report = audit_user(
         client,
         allowlist,
-        hmac_key,
         max_pages=args.max_pages,
     )
     atomic_write_json(args.output, report)
