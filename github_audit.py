@@ -19,7 +19,7 @@ from urllib.parse import urlparse
 import requests
 
 GITHUB_API_URL = "https://api.github.com"
-GITHUB_API_VERSION = "2026-03-10"
+GITHUB_API_VERSION = "2022-11-28"
 DEFAULT_ALLOWLIST_FILE = "github_user_allowlist.json"
 DEFAULT_OUTPUT_FILE = "github_tushare_findings.json"
 DEFAULT_TIMEOUT = 20.0
@@ -41,9 +41,14 @@ SEARCH_TERMS = (
     '"ts.set_token"',
     '"ts.pro_api"',
     '"TUSHARE_TOKEN"',
-    '"TUSHARE_KEY"',
     '"TS_TOKEN"',
 )
+
+# GitHub Code Search 不支持括号，直接 OR 拼接
+SEARCH_QUERIES = [
+    " OR ".join(SEARCH_TERMS[:3]) + " in:file",
+    " OR ".join(SEARCH_TERMS[3:]) + " in:file",
+]
 
 DETECTORS = (
     (
@@ -370,53 +375,52 @@ class GitHubClient:
         max_pages: int,
     ) -> tuple[list[dict[str, Any]], bool]:
         """全站搜索公开代码中可能包含 Tushare Token 的文件。"""
-        expression = " OR ".join(SEARCH_TERMS)
-        query = f"({expression}) in:file"
         results: dict[tuple[str, str], dict[str, Any]] = {}
         incomplete = False
 
-        for page in range(1, max_pages + 1):
-            self._wait_for_search_slot()
-            response = self._request(
-                "GET",
-                f"{GITHUB_API_URL}/search/code",
-                params={"q": query, "per_page": 100, "page": page},
-            )
-            payload = self._json_object(response)
-            items = payload.get("items")
-            if not isinstance(items, list):
-                raise GitHubAPIError("GitHub 代码搜索结果结构异常")
+        for query in SEARCH_QUERIES:
+            for page in range(1, max_pages + 1):
+                self._wait_for_search_slot()
+                response = self._request(
+                    "GET",
+                    f"{GITHUB_API_URL}/search/code",
+                    params={"q": query, "per_page": 100, "page": page},
+                )
+                payload = self._json_object(response)
+                items = payload.get("items")
+                if not isinstance(items, list):
+                    raise GitHubAPIError("GitHub 代码搜索结果结构异常")
 
-            incomplete = incomplete or payload.get("incomplete_results") is True
-            try:
-                total_count = int(payload.get("total_count") or 0)
-            except (TypeError, ValueError):
-                raise GitHubAPIError("GitHub 代码搜索结果数量格式异常") from None
-            if total_count < 0:
-                raise GitHubAPIError("GitHub 代码搜索结果数量格式异常")
-            if total_count > MAX_SEARCH_RESULTS:
-                incomplete = True
-
-            for item in items:
-                if not isinstance(item, dict):
-                    continue
-                result_repo = item.get("repository") or {}
-                if not isinstance(result_repo, dict):
-                    continue
-                full_name = str(result_repo.get("full_name") or "")
-                path = str(item.get("path") or "")
-                if not full_name or not path:
-                    continue
-                results[(full_name.casefold(), path)] = item
-
-            if len(items) < 100:
-                if page * 100 < min(total_count, MAX_SEARCH_RESULTS):
+                incomplete = incomplete or payload.get("incomplete_results") is True
+                try:
+                    total_count = int(payload.get("total_count") or 0)
+                except (TypeError, ValueError):
+                    raise GitHubAPIError("GitHub 代码搜索结果数量格式异常") from None
+                if total_count < 0:
+                    raise GitHubAPIError("GitHub 代码搜索结果数量格式异常")
+                if total_count > MAX_SEARCH_RESULTS:
                     incomplete = True
-                break
-            if page * 100 >= min(total_count, MAX_SEARCH_RESULTS):
-                break
-            if page == max_pages:
-                incomplete = True
+
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    result_repo = item.get("repository") or {}
+                    if not isinstance(result_repo, dict):
+                        continue
+                    full_name = str(result_repo.get("full_name") or "")
+                    path = str(item.get("path") or "")
+                    if not full_name or not path:
+                        continue
+                    results[(full_name.casefold(), path)] = item
+
+                if len(items) < 100:
+                    if page * 100 < min(total_count, MAX_SEARCH_RESULTS):
+                        incomplete = True
+                    break
+                if page * 100 >= min(total_count, MAX_SEARCH_RESULTS):
+                    break
+                if page == max_pages:
+                    incomplete = True
 
         return list(results.values()), incomplete
 
